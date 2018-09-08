@@ -139,7 +139,8 @@ void UpdateEverything() {
         int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) ProcessData[I].BaseAddress, (LPVOID) MemoryBuffer[I], ProcessData[I].RegionSize, &BytesRead);
         if (!ReturnValue) {
             int ErrorValue = GetLastError();
-            printf("ERROR: Problem occurred while updating region. Code: %d\n", ErrorValue);
+            // TODO
+            //printf("ERROR: Problem occurred while updating region. Code: %d\n", ErrorValue);
         }
     }
 }
@@ -304,14 +305,16 @@ int main(int argc, char **argv) {
 
                     if (ImGui::Button("Find Unicode") && strlen(ValueToFind)) {
                         Searched = UNICODE;
-                        // TODO: Add ASCII mode
-#if 1
                         char UnicodeStr[50] = {};
                         int LenInBytes = ConvertAsciiToUtf8(ValueToFind, UnicodeStr);
                         SearchForValue(UnicodeStr, LenInBytes, 1);
-#else
+                    }
+
+                    ImGui::SameLine();
+
+                    if (ImGui::Button("Find ASCII") && strlen(ValueToFind)) {
+                        Searched = ASCII;
                         SearchForValue(ValueToFind, strlen(ValueToFind), 1);
-#endif
                     }
 
                     ImGui::SameLine();
@@ -321,23 +324,44 @@ int main(int argc, char **argv) {
                         strcpy(ValueToFind, "");
                     }
 
-                    if (Searched == INTEGER) {
-                        for (int I = 0; I < NumCandidates; I++) {
-                            ImGui::Text("%p %d\n", (unsigned char *) Candidates[I].Address, *((int *)Candidates[I].PointerToCurValue));
-                        }
-                    } else if (Searched == UNICODE) {
-                        for (int I = 0; I < NumCandidates; I++) {
-                            char Output[100] = {};
-                            ConvertUtf8ToAscii((char *) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes, Output);
+                    switch (Searched) {
+                        case NONE:
+                            break;
+                        case INTEGER:
+                            for (int I = 0; I < NumCandidates; I++) {
+                                ImGui::Text("%p %d\n", (unsigned char *) Candidates[I].Address, *((int *)Candidates[I].PointerToCurValue));
+                            }
+                            break;
+                        case UNICODE:
+                            for (int I = 0; I < NumCandidates; I++) {
+                                char Output[100] = {};
+                                ConvertUtf8ToAscii((char *) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes, Output);
 
-                            char Text[100] = {};
-                            sprintf(Text, "%p ", (unsigned char *) Candidates[I].Address);
-                            int CurSize = strlen(Text);
-                            sprintf(Text + CurSize, "%s", Output);
-                            CurSize = strlen(Text);
+                                char Text[100] = {};
+                                sprintf(Text, "%p ", (unsigned char *) Candidates[I].Address);
+                                int CurSize = strlen(Text);
+                                sprintf(Text + CurSize, "%s", Output);
+                                CurSize = strlen(Text);
 
-                            ImGui::Text("%s\n", Text);
-                        }
+                                ImGui::Text("%s\n", Text);
+                            }
+                            break;
+                        case ASCII:
+                            for (int I = 0; I < NumCandidates; I++) {
+                                char Output[100] = {};
+                                strncpy(Output, (char *) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes);
+
+                                char Text[100] = {};
+                                sprintf(Text, "%p ", (unsigned char *) Candidates[I].Address);
+                                int CurSize = strlen(Text);
+                                sprintf(Text + CurSize, "%s", Output);
+                                CurSize = strlen(Text);
+
+                                ImGui::Text("%s\n", Text);
+                            }
+                            break;
+                        default:
+                            assert(false);
                     }
                 } else {
                     ImGui::Text("Failed to attach!\n");
@@ -363,7 +387,7 @@ int main(int argc, char **argv) {
 
             ImGui::SameLine();
 
-            if (ImGui::Button("Write String")) {
+            if (ImGui::Button("Write Unicode")) {
                 char UnicodeStr[50] = {};
                 int LenInBytes = ConvertAsciiToUtf8(ValueToWrite, UnicodeStr);
                 int Err = WriteProcessMemory(ProcessHandle, (LPVOID) strtoll(AddressToWrite, NULL, 16), (LPCVOID) UnicodeStr, LenInBytes, NULL);
@@ -371,6 +395,16 @@ int main(int argc, char **argv) {
                     printf("ERROR writing process memory!\n");
                 }
             }
+
+            ImGui::SameLine();
+
+            if (ImGui::Button("Write ASCII")) {
+                int Err = WriteProcessMemory(ProcessHandle, (LPVOID) strtoll(AddressToWrite, NULL, 16), (LPCVOID) ValueToWrite, strlen(ValueToWrite), NULL);
+                if (!Err) {
+                    printf("ERROR writing process memory!\n");
+                }
+            }
+
             ImGui::End();
         }
 

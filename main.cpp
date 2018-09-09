@@ -23,6 +23,7 @@
 #define WRITABLE (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)
 
 // TODO; fix all magic numbers
+// check if there are any memory leaks
 
 //
 // DATA
@@ -75,10 +76,56 @@ void DumpMemoryRegionsInfo() {
     }
 }
 
+// Scan the whole memory and builds an array of memory regions
+void ScanEverything() {
+    unsigned char *Addr = 0;
+    for (NumRegions = 0;;) {
+        if (VirtualQueryEx(ProcessHandle, Addr, &ProcessData[NumRegions], sizeof(ProcessData[NumRegions])) == 0) {
+            printf("Finished querying process memory.\nFound %d writable regions.\n", NumRegions);
+            break;
+        }
+
+        Addr = (unsigned char *)ProcessData[NumRegions].BaseAddress + ProcessData[NumRegions].RegionSize;
+
+        // TODO: figure out which pages arent being filtered correctly (we're getting some error codes 299 on ReadProcessMemory)
+        if ((ProcessData[NumRegions].State & MEM_COMMIT) && (ProcessData[NumRegions].Protect & WRITABLE)) {
+            if (MemoryBuffer[NumRegions]) {
+                free(MemoryBuffer[NumRegions]);
+            }
+            MemoryBuffer[NumRegions] = (unsigned char *) calloc(ProcessData[NumRegions].RegionSize, sizeof(char));
+            SIZE_T BytesRead;
+            int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) ProcessData[NumRegions].BaseAddress, (LPVOID) MemoryBuffer[NumRegions], ProcessData[NumRegions].RegionSize, &BytesRead);
+            if (!ReturnValue) {
+                int ErrorValue = GetLastError();
+                // TODO
+                //printf("ERROR: Problem occurred while reading region. Code: %d\n", ErrorValue);
+            }
+
+            NumRegions++;
+        }
+    }
+}
+
+// UNUSED
+// TODO: Optimize this
+// Reads every single region again (doesn't discover new regions)
+void UpdateEverything() {
+    for (int I = 0; I < NumRegions; I++) {
+        SIZE_T BytesRead;
+        int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) ProcessData[I].BaseAddress, (LPVOID) MemoryBuffer[I], ProcessData[I].RegionSize, &BytesRead);
+        if (!ReturnValue) {
+            int ErrorValue = GetLastError();
+            // TODO
+            //printf("ERROR: Problem occurred while updating region. Code: %d\n", ErrorValue);
+        }
+    }
+}
+
 // If there are no candidates, scans the whole memory and build a list of matching candidates
 // Otherwise, scans the candidates list to filter it using a new value
 void SearchForValue(char *Data, int Len, int Stride) {
     if (NumCandidates == -1) { // TODO: redo this, its a dirty hack for now
+        ScanEverything();
         for (int I = 0; I < NumRegions; I++) {
             for (int J = 0; J < ProcessData[I].RegionSize - Len; J+=Stride) {
                 char *Candidate = (char *) &MemoryBuffer[I][J];
@@ -100,47 +147,6 @@ void SearchForValue(char *Data, int Len, int Stride) {
             } else {
                 I++;
             }
-        }
-    }
-}
-
-// Scan the whole memory and builds an array of memory regions
-void ScanEverything() {
-    unsigned char *Addr = 0;
-    for (NumRegions = 0;;) {
-        if (VirtualQueryEx(ProcessHandle, Addr, &ProcessData[NumRegions], sizeof(ProcessData[NumRegions])) == 0) {
-            printf("Finished querying process memory.\nFound %d writable regions.\n", NumRegions);
-            break;
-        }
-
-        Addr = (unsigned char *)ProcessData[NumRegions].BaseAddress + ProcessData[NumRegions].RegionSize;
-
-        // TODO: figure out which pages arent being filtered correctly (we're getting some error codes 299 on ReadProcessMemory)
-        if ((ProcessData[NumRegions].State & MEM_COMMIT) && (ProcessData[NumRegions].Protect & WRITABLE)) {
-            MemoryBuffer[NumRegions] = (unsigned char *) calloc(ProcessData[NumRegions].RegionSize, sizeof(char));
-            SIZE_T BytesRead;
-            int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) ProcessData[NumRegions].BaseAddress, (LPVOID) MemoryBuffer[NumRegions], ProcessData[NumRegions].RegionSize, &BytesRead);
-            if (!ReturnValue) {
-                int ErrorValue = GetLastError();
-                // TODO
-                //printf("ERROR: Problem occurred while reading region. Code: %d\n", ErrorValue);
-            }
-
-            NumRegions++;
-        }
-    }
-}
-
-// TODO: Optimize this
-// Reads every single region again (doesn't discover new regions)
-void UpdateEverything() {
-    for (int I = 0; I < NumRegions; I++) {
-        SIZE_T BytesRead;
-        int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) ProcessData[I].BaseAddress, (LPVOID) MemoryBuffer[I], ProcessData[I].RegionSize, &BytesRead);
-        if (!ReturnValue) {
-            int ErrorValue = GetLastError();
-            // TODO
-            //printf("ERROR: Problem occurred while updating region. Code: %d\n", ErrorValue);
         }
     }
 }
@@ -259,7 +265,7 @@ int main(int argc, char **argv) {
                 ImGui::InputText("Process ID", ProcessIdBuffer, IM_ARRAYSIZE(ProcessIdBuffer));
                 if (ImGui::Button("Attach")) {
                     ProcessHandle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, atoi(ProcessIdBuffer));
-                    ScanEverything();
+                    //ScanEverything();
                     Attached = true;
                 }
 
@@ -282,16 +288,9 @@ int main(int argc, char **argv) {
             } else {
                 if (ProcessHandle) {
                     ImGui::Text("Attached Successfully!\n");
-                    // TODO: Optimize all of this
 
                     if (NumCandidates != -1) {
                         UpdateCandidates();
-                    } else {
-                        TimeSinceUpdate += DeltaTime;
-                        if (TimeSinceUpdate > 3) { // TODO: lower this once it is optimized
-                            UpdateEverything();
-                            TimeSinceUpdate = 0;
-                        }
                     }
 
                     ImGui::InputText("Value to find", ValueToFind, IM_ARRAYSIZE(ValueToFind));
@@ -314,7 +313,9 @@ int main(int argc, char **argv) {
 
                     if (ImGui::Button("Find ASCII") && strlen(ValueToFind)) {
                         Searched = ASCII;
-                        SearchForValue(ValueToFind, strlen(ValueToFind), 1);
+                        char AsciiStr[50] = {};
+                        strcpy(AsciiStr, ValueToFind);
+                        SearchForValue(AsciiStr, strlen(AsciiStr), 1);
                     }
 
                     ImGui::SameLine();
@@ -371,7 +372,7 @@ int main(int argc, char **argv) {
         }
 
         // Writing Window
-        {
+        if (Attached) {
             ImGui::SetNextWindowSize(ImVec2(0, 0));
             ImGui::Begin("Writing Window");
             ImGui::InputText("Address", AddressToWrite, IM_ARRAYSIZE(AddressToWrite));

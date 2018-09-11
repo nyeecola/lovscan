@@ -22,7 +22,8 @@
 
 #define WRITABLE (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)
 
-// TODO; fix all magic numbers
+// TODO
+// fix all magic numbers
 // check if there are any memory leaks
 
 //
@@ -69,15 +70,18 @@ static void GlfwErrorCallback(int error, const char* description)
     fprintf(stderr, "Glfw Error %d: %s\n", error, description);
 }
 
+#if 0
 // UNUSED
 void DumpMemoryRegionsInfo() {
     for (int I = 0; I < NumRegions; I++) {
         ImGui::Text("0x%p %lld\n", ProcessData[I].BaseAddress, ProcessData[I].RegionSize);
     }
 }
+#endif
 
 // Scan the whole memory and builds an array of memory regions
 void ScanEverything() {
+    puts("------------");
     unsigned char *Addr = 0;
     for (NumRegions = 0;;) {
         if (VirtualQueryEx(ProcessHandle, Addr, &ProcessData[NumRegions], sizeof(ProcessData[NumRegions])) == 0) {
@@ -90,6 +94,8 @@ void ScanEverything() {
         // TODO: figure out which pages arent being filtered correctly (we're getting some error codes 299 on ReadProcessMemory)
         if ((ProcessData[NumRegions].State & MEM_COMMIT) && (ProcessData[NumRegions].Protect & WRITABLE)) {
             if (MemoryBuffer[NumRegions]) {
+                //DEBUG
+                puts("THIS MESSAGE SHOULDNT APPEAR RIGHT NOW");
                 free(MemoryBuffer[NumRegions]);
             }
             MemoryBuffer[NumRegions] = (unsigned char *) calloc(ProcessData[NumRegions].RegionSize, sizeof(char));
@@ -97,15 +103,17 @@ void ScanEverything() {
             int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) ProcessData[NumRegions].BaseAddress, (LPVOID) MemoryBuffer[NumRegions], ProcessData[NumRegions].RegionSize, &BytesRead);
             if (!ReturnValue) {
                 int ErrorValue = GetLastError();
+                printf("BytesRead %lld\n", BytesRead);
                 // TODO
                 //printf("ERROR: Problem occurred while reading region. Code: %d\n", ErrorValue);
+            } else {
+                NumRegions++;
             }
-
-            NumRegions++;
         }
     }
 }
 
+#if 0
 // UNUSED
 // TODO: Optimize this
 // Reads every single region again (doesn't discover new regions)
@@ -120,6 +128,7 @@ void UpdateEverything() {
         }
     }
 }
+#endif
 
 // If there are no candidates, scans the whole memory and build a list of matching candidates
 // Otherwise, scans the candidates list to filter it using a new value
@@ -130,14 +139,17 @@ void SearchForValue(char *Data, int Len, int Stride) {
             for (int J = 0; J < ProcessData[I].RegionSize - Len; J+=Stride) {
                 char *Candidate = (char *) &MemoryBuffer[I][J];
                 if (!memcmp(Candidate, Data, Len)) {
+#if 1
                     Candidates[NumCandidates].Address = (unsigned char *)ProcessData[I].BaseAddress + J;
                     Candidates[NumCandidates].PointerToCurValue = (void *) &MemoryBuffer[I][J];
                     Candidates[NumCandidates].ValueSizeInBytes = Len;
                     NumCandidates++;
+#endif
                 }
             }
         }
     } else {
+#if 0
         for (int I = 0; I < NumCandidates;) {
             if (memcmp((char *)Candidates[I].PointerToCurValue, Data, Len)) {
                 for (int J = I; J < NumCandidates-1; J++) {
@@ -148,11 +160,13 @@ void SearchForValue(char *Data, int Len, int Stride) {
                 I++;
             }
         }
+#endif
     }
 }
 
 // Reads every single candidate again (doesn't add new candidates)
 void UpdateCandidates() {
+#if 0
     for (int I = 0; I < NumCandidates; I++) {
         SIZE_T BytesRead;
         int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) Candidates[I].Address, (LPVOID) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes, &BytesRead);
@@ -161,21 +175,23 @@ void UpdateCandidates() {
             printf("ERROR: Problem occurred while reading region. Code: %d\n", ErrorValue);
         }
     }
+#endif
 }
 
 // expects a null terminated input
 // returns the length in bytes of the output
-int ConvertAsciiToUtf8(char *Ascii, char *Utf8) {
-    int LenInWchar = MultiByteToWideChar(CP_UTF8, 0, Ascii, strlen(Ascii), NULL, 0);
-    MultiByteToWideChar(CP_UTF8, 0, Ascii, strlen(Ascii), (LPWSTR) Utf8, LenInWchar);
-    return LenInWchar * 2;
+int ConvertUtf8ToUtf16(char *Utf8, char *Utf16, int MaxBytes) {
+    int MaxUtf16Count = MaxBytes / sizeof(WCHAR);
+    int LenInWchar = MultiByteToWideChar(CP_UTF8, 0, Utf8, -1, (LPWSTR) Utf16, MaxUtf16Count);
+    return (LenInWchar-1) * sizeof(WCHAR); // we purposefully omit the null terminator
 }
 
-// expects a null terminated input
 // returns the length in bytes of the output
-int ConvertUtf8ToAscii(char *Utf8, int LenInBytes, char *Ascii) {
-    WideCharToMultiByte(CP_ACP, 0, (LPWSTR) Utf8, LenInBytes / 2, Ascii, LenInBytes / 2, 0, NULL);
-    return LenInBytes / 2;
+int ConvertUtf16toUtf8(char *Utf16, int LenInBytes, char *Utf8, int MaxBytes) {
+    int Utf16Count = LenInBytes / sizeof(WCHAR);
+    int ByteCount = WideCharToMultiByte(CP_UTF8, 0, (LPWSTR) Utf16, Utf16Count, Utf8, MaxBytes-1, 0, NULL);
+    Utf8[ByteCount] = 0;
+    return ByteCount;
 }
 
 int main(int argc, char **argv) {
@@ -269,6 +285,7 @@ int main(int argc, char **argv) {
                     Attached = true;
                 }
 
+#if 0
                 DWORD Processes[1024], ProcessesSizeBytes, ProcessesSize;
                 if ( !EnumProcesses( Processes, sizeof(Processes), &ProcessesSizeBytes ) )
                     return NULL;
@@ -284,16 +301,22 @@ int main(int argc, char **argv) {
                             ImGui::Text("%6d %s\n", Processes[I], ProcessName);
                         }
                     }
+                    CloseHandle(H);
                 }
+#endif
             } else {
                 if (ProcessHandle) {
                     ImGui::Text("Attached Successfully!\n");
 
+#if 0
                     if (NumCandidates != -1) {
                         UpdateCandidates();
                     }
+#endif
 
                     ImGui::InputText("Value to find", ValueToFind, IM_ARRAYSIZE(ValueToFind));
+
+#if 0
                     if (ImGui::Button("Find Int") && strlen(ValueToFind)) {
                         Searched = INTEGER;
                         int Target = atoi(ValueToFind);
@@ -301,14 +324,16 @@ int main(int argc, char **argv) {
                     }
 
                     ImGui::SameLine();
+#endif
 
                     if (ImGui::Button("Find Unicode") && strlen(ValueToFind)) {
                         Searched = UNICODE;
                         char UnicodeStr[50] = {};
-                        int LenInBytes = ConvertAsciiToUtf8(ValueToFind, UnicodeStr);
-                        SearchForValue(UnicodeStr, LenInBytes, 1);
+                        int LenInBytes = ConvertUtf8ToUtf16(ValueToFind, UnicodeStr, 50);
+                        //SearchForValue(UnicodeStr, LenInBytes, 1);
                     }
 
+#if 0
                     ImGui::SameLine();
 
                     if (ImGui::Button("Find ASCII") && strlen(ValueToFind)) {
@@ -336,7 +361,7 @@ int main(int argc, char **argv) {
                         case UNICODE:
                             for (int I = 0; I < NumCandidates; I++) {
                                 char Output[100] = {};
-                                ConvertUtf8ToAscii((char *) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes, Output);
+                                ConvertUtf16toUtf8((char *) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes, Output, 100);
 
                                 char Text[100] = {};
                                 sprintf(Text, "%p ", (unsigned char *) Candidates[I].Address);
@@ -364,6 +389,7 @@ int main(int argc, char **argv) {
                         default:
                             assert(false);
                     }
+#endif
                 } else {
                     ImGui::Text("Failed to attach!\n");
                 }
@@ -371,6 +397,7 @@ int main(int argc, char **argv) {
             ImGui::End();
         }
 
+#if 0
         // Writing Window
         if (Attached) {
             ImGui::SetNextWindowSize(ImVec2(0, 0));
@@ -390,7 +417,7 @@ int main(int argc, char **argv) {
 
             if (ImGui::Button("Write Unicode")) {
                 char UnicodeStr[50] = {};
-                int LenInBytes = ConvertAsciiToUtf8(ValueToWrite, UnicodeStr);
+                int LenInBytes = ConvertUtf8ToUtf16(ValueToWrite, UnicodeStr, 50);
                 int Err = WriteProcessMemory(ProcessHandle, (LPVOID) strtoll(AddressToWrite, NULL, 16), (LPCVOID) UnicodeStr, LenInBytes, NULL);
                 if (!Err) {
                     printf("ERROR writing process memory!\n");
@@ -408,6 +435,7 @@ int main(int argc, char **argv) {
 
             ImGui::End();
         }
+#endif
 
         // Rendering (end of frame)
         {
@@ -435,6 +463,8 @@ int main(int argc, char **argv) {
 
     glfwDestroyWindow(window);
     glfwTerminate();
+
+    puts("END!"); // DEBUG
     
     return 0;
 }

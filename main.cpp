@@ -1,13 +1,15 @@
 #define NTDDI_VERSION NTDDI_WIN7
 #define _WIN32_WINNT _WIN32_WINNT_WIN7
 
-#include <afxwin.h>
-#include <Psapi.h>
+//#include <afxwin.h>
 #include <windows.h>
+#include <Psapi.h>
 #include <stdio.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "gl3w/gl3w.c"
 
 #define IMGUI_IMPL_OPENGL_LOADER_GL3W
 #include "GL/gl3w.h"
@@ -50,14 +52,18 @@ struct candidate_info {
 };
 
 // Array storing all current candidates
-candidate_info *Candidates = (candidate_info *) calloc(20000, sizeof(*Candidates));
+#define MAX_CANDIDATES 2000000
+candidate_info *Candidates = (candidate_info *) calloc(MAX_CANDIDATES, sizeof(*Candidates));
+int *DeadCandidates = (int *) calloc(MAX_CANDIDATES, sizeof(*DeadCandidates));
 int NumCandidates = -1;
 
 enum search_mode {
-    NONE,
-    INTEGER,
-    UNICODE,
-    ASCII
+    MODE_NONE,
+    MODE_BYTE,
+    MODE_SHORT,
+    MODE_INTEGER,
+    MODE_UNICODE,
+    MODE_ASCII
 };
 
 
@@ -81,21 +87,23 @@ void DumpMemoryRegionsInfo() {
 
 // Scan the whole memory and builds an array of memory regions
 void ScanEverything() {
-    puts("------------");
+    //puts("-----------ScanEverything------------");
     unsigned char *Addr = 0;
     for (NumRegions = 0;;) {
+        // read information about this region and store it in ProcessData[NumRegions]
         if (VirtualQueryEx(ProcessHandle, Addr, &ProcessData[NumRegions], sizeof(ProcessData[NumRegions])) == 0) {
             printf("Finished querying process memory.\nFound %d writable regions.\n", NumRegions);
             break;
         }
 
+        // compute next address to query (before incrementing NumRegions)
         Addr = (unsigned char *)ProcessData[NumRegions].BaseAddress + ProcessData[NumRegions].RegionSize;
 
-        // TODO: figure out which pages arent being filtered correctly (we're getting some error codes 299 on ReadProcessMemory)
-        if ((ProcessData[NumRegions].State & MEM_COMMIT) && (ProcessData[NumRegions].Protect & WRITABLE)) {
+        // read all the memory from the current region and store it in MemoryBuffer[NumRegions]
+        if ((ProcessData[NumRegions].State & MEM_COMMIT) &&
+            !(ProcessData[NumRegions].Protect & PAGE_GUARD) &&
+            (ProcessData[NumRegions].Protect & WRITABLE)) {
             if (MemoryBuffer[NumRegions]) {
-                //DEBUG
-                puts("THIS MESSAGE SHOULDNT APPEAR RIGHT NOW");
                 free(MemoryBuffer[NumRegions]);
             }
             MemoryBuffer[NumRegions] = (unsigned char *) calloc(ProcessData[NumRegions].RegionSize, sizeof(char));
@@ -103,9 +111,11 @@ void ScanEverything() {
             int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) ProcessData[NumRegions].BaseAddress, (LPVOID) MemoryBuffer[NumRegions], ProcessData[NumRegions].RegionSize, &BytesRead);
             if (!ReturnValue) {
                 int ErrorValue = GetLastError();
-                printf("BytesRead %lld\n", BytesRead);
-                // TODO
-                //printf("ERROR: Problem occurred while reading region. Code: %d\n", ErrorValue);
+                //fprintf(stderr, "ERROR: Tried to read from process handle 0x%p at address 0x%p and region size %lld with protection 0x%x\n", (LPVOID) ProcessHandle, (LPVOID) ProcessData[NumRegions].BaseAddress, ProcessData[NumRegions].RegionSize, ProcessData[NumRegions].Protect);
+                //fprintf(stderr, "ERROR: BytesRead %lld\n", BytesRead);
+                // TODO: does this ever happen? If we so, are we handling it correctly?
+                //       Isn't it possible that not incrementing NumRegions here leads to problems? Maybe not. I think this is correct.
+                fprintf(stderr, "ERROR: Problem occurred while reading region. Code: %d\n", ErrorValue); 
             } else {
                 NumRegions++;
             }
@@ -113,34 +123,30 @@ void ScanEverything() {
     }
 }
 
-#if 0
-// UNUSED
-// TODO: Optimize this
-// Reads every single region again (doesn't discover new regions)
-void UpdateEverything() {
-    for (int I = 0; I < NumRegions; I++) {
-        SIZE_T BytesRead;
-        int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) ProcessData[I].BaseAddress, (LPVOID) MemoryBuffer[I], ProcessData[I].RegionSize, &BytesRead);
-        if (!ReturnValue) {
-            int ErrorValue = GetLastError();
-            // TODO
-            //printf("ERROR: Problem occurred while updating region. Code: %d\n", ErrorValue);
-        }
-    }
-}
-#endif
-
 // If there are no candidates, scans the whole memory and build a list of matching candidates
 // Otherwise, scans the candidates list to filter it using a new value
 void SearchForValue(char *Data, int Len, int Stride) {
+    //fprintf(stderr, "SearchForValue() start\n");
     if (NumCandidates == -1) { // TODO: redo this, its a dirty hack for now
         ScanEverything();
         for (int I = 0; I < NumRegions; I++) {
             for (int J = 0; J < ProcessData[I].RegionSize - Len; J+=Stride) {
                 char *Candidate = (char *) &MemoryBuffer[I][J];
+                //fprintf(stderr, "memcmp(0x%p, 0x%p, %d)\n", Candidate, Data, Len);
+
+                if (NumCandidates >= MAX_CANDIDATES) { // TODO: protect against this overflow properly
+                    fprintf(stderr, "ERROR: TOO MANY CANDIDATES!!\n");
+                    abort();
+                }
+
                 if (!memcmp(Candidate, Data, Len)) {
+#if 0
+                    if (NumCandidates % 10000 == 0) {
+                        fprintf(stderr, "NumCandidates == %d\n", NumCandidates);
+                    }
+#endif
 #if 1
-                    Candidates[NumCandidates].Address = (unsigned char *)ProcessData[I].BaseAddress + J;
+                    Candidates[NumCandidates].Address = (unsigned char *) ProcessData[I].BaseAddress + J;
                     Candidates[NumCandidates].PointerToCurValue = (void *) &MemoryBuffer[I][J];
                     Candidates[NumCandidates].ValueSizeInBytes = Len;
                     NumCandidates++;
@@ -149,33 +155,46 @@ void SearchForValue(char *Data, int Len, int Stride) {
             }
         }
     } else {
-#if 0
-        for (int I = 0; I < NumCandidates;) {
+#if 1
+        int NumDeadCandidates = 0;
+        memset(DeadCandidates, 0, sizeof(*DeadCandidates));
+        for (int I = 0; I < NumCandidates; I++) {
             if (memcmp((char *)Candidates[I].PointerToCurValue, Data, Len)) {
-                for (int J = I; J < NumCandidates-1; J++) {
-                    Candidates[J] = Candidates[J+1];
-                }
-                NumCandidates--;
-            } else {
-                I++;
+                // mark candidate for deletion
+                DeadCandidates[NumDeadCandidates++] = I;
             }
+        }
+
+        // delete dead candidates (could be optimized with memcpys probably, but it's weird)
+        if (NumDeadCandidates > 0) {
+            int AliveIndex = 0;
+            int DeadIndex = 0;
+            for (int I = 0; I < NumCandidates; I++) {
+                if (I == DeadCandidates[DeadIndex]) { // if Candidates[I] is marked as dead, don't copy it
+                    DeadIndex++;
+                } else { // otherwise, copy it
+                    Candidates[AliveIndex++] = Candidates[I];
+                }
+            }
+            NumCandidates = NumCandidates - NumDeadCandidates;
         }
 #endif
     }
+    //fprintf(stderr, "SearchForValue() end\n");
 }
 
 // Reads every single candidate again (doesn't add new candidates)
 void UpdateCandidates() {
-#if 0
     for (int I = 0; I < NumCandidates; I++) {
         SIZE_T BytesRead;
+
+        // How to stop reading memory which has been freed? I assume we're getting some errors 299 for that reason.
         int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) Candidates[I].Address, (LPVOID) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes, &BytesRead);
         if (!ReturnValue) {
             int ErrorValue = GetLastError();
             printf("ERROR: Problem occurred while reading region. Code: %d\n", ErrorValue);
         }
     }
-#endif
 }
 
 // expects a null terminated input
@@ -239,15 +258,15 @@ int main(int argc, char **argv) {
 
     // TODO: free this properly (and also maybe do something about the magic number)
     //MEMORY_BASIC_INFORMATION32 ProcessData = {};
-    ProcessData = (MEMORY_BASIC_INFORMATION *) calloc(20000, sizeof(*ProcessData));
-    MemoryBuffer = (unsigned char **) calloc(20000, sizeof(*MemoryBuffer));
+    ProcessData = (MEMORY_BASIC_INFORMATION *) calloc(MAX_CANDIDATES, sizeof(*ProcessData));
+    MemoryBuffer = (unsigned char **) calloc(MAX_CANDIDATES, sizeof(*MemoryBuffer));
 
     double LastTime = glfwGetTime();
     double DeltaTime = 0, NowTime = 0;
     double TimeSinceUpdate = 0;
 
     bool Attached = false;
-    int Searched = NONE;
+    int Searched = MODE_NONE;
 
     char ProcessIdBuffer[200] = {};
     char ValueToFind[40] = {};
@@ -281,14 +300,15 @@ int main(int argc, char **argv) {
                 ImGui::InputText("Process ID", ProcessIdBuffer, IM_ARRAYSIZE(ProcessIdBuffer));
                 if (ImGui::Button("Attach")) {
                     ProcessHandle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, atoi(ProcessIdBuffer));
-                    //ScanEverything();
                     Attached = true;
                 }
 
-#if 0
+#if 1
                 DWORD Processes[1024], ProcessesSizeBytes, ProcessesSize;
-                if ( !EnumProcesses( Processes, sizeof(Processes), &ProcessesSizeBytes ) )
+                if ( !EnumProcesses( Processes, sizeof(Processes), &ProcessesSizeBytes ) ) {
+                    fprintf(stderr, "ERROR: Failed to enumerate processes.\n");
                     return NULL;
+                }
 
                 for (int I = 0; I < ProcessesSizeBytes / sizeof(DWORD); I++) {
                     HANDLE H = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, Processes[I]);
@@ -308,7 +328,7 @@ int main(int argc, char **argv) {
                 if (ProcessHandle) {
                     ImGui::Text("Attached Successfully!\n");
 
-#if 0
+#if 1
                     if (NumCandidates != -1) {
                         UpdateCandidates();
                     }
@@ -316,9 +336,30 @@ int main(int argc, char **argv) {
 
                     ImGui::InputText("Value to find", ValueToFind, IM_ARRAYSIZE(ValueToFind));
 
-#if 0
+#if 1
+                    if (ImGui::Button("Find Byte") && strlen(ValueToFind)) {
+                        Searched = MODE_BYTE;
+                        unsigned char Target = atoi(ValueToFind);
+                        SearchForValue((char *) &Target, 1, 1);
+                    }
+
+                    ImGui::SameLine();
+#endif
+
+
+#if 1
+                    if (ImGui::Button("Find Short") && strlen(ValueToFind)) {
+                        Searched = MODE_SHORT;
+                        unsigned short int Target = atoi(ValueToFind);
+                        SearchForValue((char *) &Target, 2, 2);
+                    }
+
+                    ImGui::SameLine();
+#endif
+
+#if 1
                     if (ImGui::Button("Find Int") && strlen(ValueToFind)) {
-                        Searched = INTEGER;
+                        Searched = MODE_INTEGER;
                         int Target = atoi(ValueToFind);
                         SearchForValue((char *) &Target, sizeof(Target), sizeof(Target));
                     }
@@ -327,17 +368,17 @@ int main(int argc, char **argv) {
 #endif
 
                     if (ImGui::Button("Find Unicode") && strlen(ValueToFind)) {
-                        Searched = UNICODE;
+                        Searched = MODE_UNICODE;
                         char UnicodeStr[50] = {};
                         int LenInBytes = ConvertUtf8ToUtf16(ValueToFind, UnicodeStr, 50);
-                        //SearchForValue(UnicodeStr, LenInBytes, 1);
+                        SearchForValue(UnicodeStr, LenInBytes, 1);
                     }
 
-#if 0
+#if 1
                     ImGui::SameLine();
 
                     if (ImGui::Button("Find ASCII") && strlen(ValueToFind)) {
-                        Searched = ASCII;
+                        Searched = MODE_ASCII;
                         char AsciiStr[50] = {};
                         strcpy(AsciiStr, ValueToFind);
                         SearchForValue(AsciiStr, strlen(AsciiStr), 1);
@@ -350,15 +391,27 @@ int main(int argc, char **argv) {
                         strcpy(ValueToFind, "");
                     }
 
+                    ImGui::Text("Candidates: %d\n", NumCandidates);
+
                     switch (Searched) {
-                        case NONE:
+                        case MODE_NONE:
                             break;
-                        case INTEGER:
+                        case MODE_BYTE:
+                            for (int I = 0; I < NumCandidates; I++) {
+                                ImGui::Text("%p %u\n", (unsigned char *) Candidates[I].Address, *((char *)Candidates[I].PointerToCurValue));
+                            }
+                            break;
+                        case MODE_SHORT:
+                            for (int I = 0; I < NumCandidates; I++) {
+                                ImGui::Text("%p %d\n", (unsigned char *) Candidates[I].Address, *((unsigned short int *)Candidates[I].PointerToCurValue));
+                            }
+                            break;
+                        case MODE_INTEGER:
                             for (int I = 0; I < NumCandidates; I++) {
                                 ImGui::Text("%p %d\n", (unsigned char *) Candidates[I].Address, *((int *)Candidates[I].PointerToCurValue));
                             }
                             break;
-                        case UNICODE:
+                        case MODE_UNICODE:
                             for (int I = 0; I < NumCandidates; I++) {
                                 char Output[100] = {};
                                 ConvertUtf16toUtf8((char *) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes, Output, 100);
@@ -372,7 +425,7 @@ int main(int argc, char **argv) {
                                 ImGui::Text("%s\n", Text);
                             }
                             break;
-                        case ASCII:
+                        case MODE_ASCII:
                             for (int I = 0; I < NumCandidates; I++) {
                                 char Output[100] = {};
                                 strncpy(Output, (char *) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes);
@@ -397,7 +450,7 @@ int main(int argc, char **argv) {
             ImGui::End();
         }
 
-#if 0
+#if 1
         // Writing Window
         if (Attached) {
             ImGui::SetNextWindowSize(ImVec2(0, 0));

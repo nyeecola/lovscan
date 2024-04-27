@@ -24,9 +24,14 @@
 
 #define WRITABLE (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)
 
-// TODO
-// fix all magic numbers
-// check if there are any memory leaks
+/* TODO:
+ * - Make address copyable with mouse
+ * - (MAYBE_FIXED) Find out why the search is duplicating candidates sometimes, it's probably related to my code for deleting dead candidates.
+ * - Figure out how to find stable addresses, meaning global addresses probably. Look up how cheat engine does it and what it means.
+ * - Load all modules and specifically look for the "<process_name>.exe" one, instead of hoping it's the first one in the list.
+ * - Fix all magic numbers
+ * - Check if there are any memory leaks
+ */
 
 //
 // DATA
@@ -43,6 +48,7 @@ int NumRegions;
 
 // "Attached" process handle
 HANDLE ProcessHandle;
+DWORD64 BaseAddress = 0;
 
 // Struct storing information about a matching candidate
 struct candidate_info {
@@ -166,18 +172,16 @@ void SearchForValue(char *Data, int Len, int Stride) {
         }
 
         // delete dead candidates (could be optimized with memcpys probably, but it's weird)
-        if (NumDeadCandidates > 0) {
-            int AliveIndex = 0;
-            int DeadIndex = 0;
-            for (int I = 0; I < NumCandidates; I++) {
-                if (I == DeadCandidates[DeadIndex]) { // if Candidates[I] is marked as dead, don't copy it
-                    DeadIndex++;
-                } else { // otherwise, copy it
-                    Candidates[AliveIndex++] = Candidates[I];
-                }
+        int AliveIndex = 0;
+        int DeadIndex = 0;
+        for (int I = 0; I < NumCandidates; I++) {
+            if (DeadIndex < NumDeadCandidates && I == DeadCandidates[DeadIndex]) { // if Candidates[I] is marked as dead, don't copy it
+                DeadIndex++;
+            } else { // otherwise, copy it
+                Candidates[AliveIndex++] = Candidates[I];
             }
-            NumCandidates = NumCandidates - NumDeadCandidates;
         }
+        NumCandidates = NumCandidates - NumDeadCandidates;
 #endif
     }
     //fprintf(stderr, "SearchForValue() end\n");
@@ -300,6 +304,23 @@ int main(int argc, char **argv) {
                 ImGui::InputText("Process ID", ProcessIdBuffer, IM_ARRAYSIZE(ProcessIdBuffer));
                 if (ImGui::Button("Attach")) {
                     ProcessHandle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, atoi(ProcessIdBuffer));
+
+#if 1
+                    HMODULE Mod;
+                    DWORD Needed;
+                    if (EnumProcessModules(ProcessHandle, &Mod, sizeof(Mod), &Needed)) {
+                        if (Needed > sizeof(Mod)) {
+                            // This might be a problem since we need the right module to get the process base address.
+                            // Check out https://stackoverflow.com/questions/14467229/get-base-address-of-process
+                            //fprintf(stderr, "Needed %d bytes for Module handles array, but got only %zd instead\n", Needed, sizeof(Mod));
+                        }
+                        char ModName[200];
+                        GetModuleFileNameEx(ProcessHandle, Mod, ModName, sizeof(ModName)/sizeof(char));
+                        printf("Module name: %s\n", ModName);
+                        BaseAddress = (DWORD64) &Mod;
+                    }
+#endif
+
                     Attached = true;
                 }
 
@@ -317,6 +338,11 @@ int main(int argc, char **argv) {
                         DWORD Needed;
                         char ProcessName[200];
                         if (EnumProcessModules(H, &Mod, sizeof(Mod), &Needed)) {
+                            if (Needed > sizeof(Mod)) {
+                                // This might be a problem since we need the right module to get the process base address.
+                                // Check out https://stackoverflow.com/questions/14467229/get-base-address-of-process
+                                //fprintf(stderr, "Needed %d bytes for Module handles array, but got only %zd instead\n", Needed, sizeof(Mod));
+                            }
                             GetModuleBaseName(H, Mod, ProcessName, sizeof(ProcessName)/sizeof(char));
                             ImGui::Text("%6d %s\n", Processes[I], ProcessName);
                         }
@@ -391,6 +417,7 @@ int main(int argc, char **argv) {
                         strcpy(ValueToFind, "");
                     }
 
+                    ImGui::Text("BaseAddress: 0x%p\n", BaseAddress);
                     ImGui::Text("Candidates: %d\n", NumCandidates);
 
                     switch (Searched) {

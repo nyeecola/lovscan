@@ -25,12 +25,14 @@
 #define WRITABLE (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)
 
 /* TODO:
- * - Make address copyable with mouse
- * - (MAYBE_FIXED) Find out why the search is duplicating candidates sometimes, it's probably related to my code for deleting dead candidates.
- * - Figure out how to find stable addresses, meaning global addresses probably. Look up how cheat engine does it and what it means.
+ * - Sort pointer mapping output.
+ * - Make address copyable with mouse.
+ * - Improve pointer mapping.
+ * - Improve pointer mapping performance.
+ * - Figure out how to find stable addresses, meaning global addresses probably.
  * - Load all modules and specifically look for the "<process_name>.exe" one, instead of hoping it's the first one in the list.
- * - Fix all magic numbers
- * - Check if there are any memory leaks
+ * - Fix all magic numbers.
+ * - Check if there are any memory leaks.
  */
 
 //
@@ -41,7 +43,7 @@
 MEMORY_BASIC_INFORMATION *ProcessData;
 
 // Array storing data from all sections of process memory that we care about
-unsigned char **MemoryBuffer;
+char **MemoryBuffer;
 
 // Total number of process memory sections that we care about
 int NumRegions;
@@ -52,8 +54,8 @@ DWORD64 BaseAddress = 0;
 
 // Struct storing information about a matching candidate
 struct candidate_info {
-    unsigned char *Address;
-    void *PointerToCurValue;
+    char *Address;
+    void *PointerToCurValue; // Pointer to our copy
     int ValueSizeInBytes;
 };
 
@@ -63,11 +65,27 @@ candidate_info *Candidates = (candidate_info *) calloc(MAX_CANDIDATES, sizeof(*C
 int *DeadCandidates = (int *) calloc(MAX_CANDIDATES, sizeof(*DeadCandidates));
 int NumCandidates = -1;
 
+// TODO: think abou this, is it too small? too big? (probably 4096 is safer?)
+#define POINTER_MAX_RANGE 4096
+struct pointer_node {
+    char *Address;
+    void *Value; // Pointer to our copy
+    int NextJumpOffset; // Offset from *Pointer to the next pointer_node
+    int NumJumps; // used to sort and filter results
+};
+// TODO: Not a full map, just a list of addresses with offsets to follow to get to the desired address, capped at 5 paths per origin.
+//       We can add a "uncapped search in the future by being smart about merging paths and making sure we are not using up too many resources"
+//       Need to think more about it.
+// TODO: could use something else other than MAX_CANDIDATES here, not sure about what size of array we need.
+pointer_node *PointerMap = (pointer_node *) calloc(MAX_CANDIDATES, sizeof(*PointerMap));
+int NumPointerNodes = 0;
+
 enum search_mode {
     MODE_NONE,
     MODE_BYTE,
     MODE_SHORT,
     MODE_INTEGER,
+    MODE_POINTER,
     MODE_UNICODE,
     MODE_ASCII
 };
@@ -93,8 +111,8 @@ void DumpMemoryRegionsInfo() {
 
 // Scan the whole memory and builds an array of memory regions
 void ScanEverything() {
-    //puts("-----------ScanEverything------------");
-    unsigned char *Addr = 0;
+    puts("-----------ScanEverything------------");
+    char *Addr = 0;
     for (NumRegions = 0;;) {
         // read information about this region and store it in ProcessData[NumRegions]
         if (VirtualQueryEx(ProcessHandle, Addr, &ProcessData[NumRegions], sizeof(ProcessData[NumRegions])) == 0) {
@@ -103,7 +121,7 @@ void ScanEverything() {
         }
 
         // compute next address to query (before incrementing NumRegions)
-        Addr = (unsigned char *)ProcessData[NumRegions].BaseAddress + ProcessData[NumRegions].RegionSize;
+        Addr = (char *) ProcessData[NumRegions].BaseAddress + ProcessData[NumRegions].RegionSize;
 
         // read all the memory from the current region and store it in MemoryBuffer[NumRegions]
         if ((ProcessData[NumRegions].State & MEM_COMMIT) &&
@@ -112,7 +130,7 @@ void ScanEverything() {
             if (MemoryBuffer[NumRegions]) {
                 free(MemoryBuffer[NumRegions]);
             }
-            MemoryBuffer[NumRegions] = (unsigned char *) calloc(ProcessData[NumRegions].RegionSize, sizeof(char));
+            MemoryBuffer[NumRegions] = (char *) calloc(ProcessData[NumRegions].RegionSize, sizeof(char));
             SIZE_T BytesRead;
             int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) ProcessData[NumRegions].BaseAddress, (LPVOID) MemoryBuffer[NumRegions], ProcessData[NumRegions].RegionSize, &BytesRead);
             if (!ReturnValue) {
@@ -127,14 +145,33 @@ void ScanEverything() {
             }
         }
     }
+    puts("-----------ScanEverything end------------");
+}
+
+// Reads every single candidate again (doesn't add new candidates)
+void UpdateCandidates() {
+    for (int I = 0; I < NumCandidates; I++) {
+        SIZE_T BytesRead;
+
+        // How to stop reading memory which has been freed? I assume we're getting some errors 299 for that reason.
+        int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) Candidates[I].Address, (LPVOID) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes, &BytesRead);
+        if (!ReturnValue) {
+            int ErrorValue = GetLastError();
+            printf("ERROR: Problem occurred while reading region. Code: %d\n", ErrorValue);
+        }
+    }
 }
 
 // If there are no candidates, scans the whole memory and build a list of matching candidates
 // Otherwise, scans the candidates list to filter it using a new value
-void SearchForValue(char *Data, int Len, int Stride) {
-    //fprintf(stderr, "SearchForValue() start\n");
+void SearchForValue(char *Data, int Len, int Stride, bool IsPointer, bool ForceRescan) {
+    fprintf(stderr, "SearchForValue(%p, %d, %d, %d) start\n", Data, Len, Stride, IsPointer);
     if (NumCandidates == -1) { // TODO: redo this, its a dirty hack for now
-        ScanEverything();
+        NumCandidates = 0;
+        
+        if (ForceRescan)
+            ScanEverything();
+
         for (int I = 0; I < NumRegions; I++) {
             for (int J = 0; J < ProcessData[I].RegionSize - Len; J+=Stride) {
                 char *Candidate = (char *) &MemoryBuffer[I][J];
@@ -145,14 +182,36 @@ void SearchForValue(char *Data, int Len, int Stride) {
                     abort();
                 }
 
-                if (!memcmp(Candidate, Data, Len)) {
+#if 0
+                if (I % 1000 == 0 || I % 1000 == 1) {
+                    fprintf(stderr, "AAAAAAAAA\n");
+                    fprintf(stderr, "AAAAAAAAA testA 0x%llx\n", *((uint64_t*)Data));
+                    fprintf(stderr, "AAAAAAAAA testB 0x%llx\n", *((uint64_t*)Candidate));
+                }
+#endif
+
+                if (IsPointer) { // TODO: fix this, it's way too hack-ish, maybe use a separate SearchForPointer() function instead
+                    if ((*((uint64_t*)Data) - *((uint64_t*)Candidate) > 0 &&
+                        *((uint64_t*)Data) - *((uint64_t*)Candidate) < POINTER_MAX_RANGE)) {
+
+#if 1
+                        if (NumCandidates % 1000 == 0) {
+                            fprintf(stderr, "NumCandidates for pointer with address 0x%llx == %d\n", *((uint64_t*)Data), NumCandidates);
+                        }
+#endif
+                        Candidates[NumCandidates].Address = (char *) ProcessData[I].BaseAddress + J;
+                        Candidates[NumCandidates].PointerToCurValue = (void *) &MemoryBuffer[I][J];
+                        Candidates[NumCandidates].ValueSizeInBytes = Len;
+                        NumCandidates++;
+                    }
+                } else if (!memcmp(Candidate, Data, Len)) {
 #if 0
                     if (NumCandidates % 10000 == 0) {
                         fprintf(stderr, "NumCandidates == %d\n", NumCandidates);
                     }
 #endif
 #if 1
-                    Candidates[NumCandidates].Address = (unsigned char *) ProcessData[I].BaseAddress + J;
+                    Candidates[NumCandidates].Address = (char *) ProcessData[I].BaseAddress + J;
                     Candidates[NumCandidates].PointerToCurValue = (void *) &MemoryBuffer[I][J];
                     Candidates[NumCandidates].ValueSizeInBytes = Len;
                     NumCandidates++;
@@ -161,11 +220,20 @@ void SearchForValue(char *Data, int Len, int Stride) {
             }
         }
     } else {
+        UpdateCandidates();
+
 #if 1
         int NumDeadCandidates = 0;
         memset(DeadCandidates, 0, sizeof(*DeadCandidates));
         for (int I = 0; I < NumCandidates; I++) {
-            if (memcmp((char *)Candidates[I].PointerToCurValue, Data, Len)) {
+            if (IsPointer) {
+                // TODO: fix this, it's way too hackish, maybe use a separate SearchForPointer() function instead
+                if (!(*((uint64_t*)Data) - *((uint64_t*)Candidates[I].PointerToCurValue) > 0 &&
+                    *((uint64_t*)Data) - *((uint64_t*)Candidates[I].PointerToCurValue) < POINTER_MAX_RANGE)) {
+                    // mark candidate for deletion
+                    DeadCandidates[NumDeadCandidates++] = I;
+                }
+            } else if (memcmp((char *)Candidates[I].PointerToCurValue, Data, Len)) {
                 // mark candidate for deletion
                 DeadCandidates[NumDeadCandidates++] = I;
             }
@@ -187,18 +255,59 @@ void SearchForValue(char *Data, int Len, int Stride) {
     //fprintf(stderr, "SearchForValue() end\n");
 }
 
-// Reads every single candidate again (doesn't add new candidates)
-void UpdateCandidates() {
-    for (int I = 0; I < NumCandidates; I++) {
-        SIZE_T BytesRead;
+// TODO: don't use the same NumCandidates Array? or make sure to clean up the Scan window?
+void GeneratePointerMapRec(char *Address, int NumJumps, int MaxNumJumps) {
+    if (NumJumps == MaxNumJumps) // TODO: think about this, maybe print something?
+        return;
 
-        // How to stop reading memory which has been freed? I assume we're getting some errors 299 for that reason.
-        int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) Candidates[I].Address, (LPVOID) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes, &BytesRead);
-        if (!ReturnValue) {
-            int ErrorValue = GetLastError();
-            printf("ERROR: Problem occurred while reading region. Code: %d\n", ErrorValue);
+    NumCandidates = -1; // create a "Reset()" function?
+    // TODO: CHECK WHY WE NEED SearchForValue() to receive a pointer anyway, that seems very prone to bugs.
+    SearchForValue(Address, 8, 8, true, false);
+    printf("NumCandidates for Address %llx: %d\n", *((uint64_t*)Address), NumCandidates);
+
+    int PrevNumPointerNodes = NumPointerNodes;
+
+    for (int I = 0; I < NumCandidates; I++) {
+        pointer_node Node = {
+            Candidates[I].Address,
+            Candidates[I].PointerToCurValue, // TODO: this might to issues because ScanEverything() makes this pointer invalid. Make sure this can never happen!
+            (int) (*((uint64_t*)Address) - *((uint64_t*)Candidates[I].PointerToCurValue)),
+            NumJumps,
+        };
+
+        bool AlreadyMapped = false;
+        for (int J = 0; J < PrevNumPointerNodes; J++) {
+            if (Node.Address == PointerMap[J].Address) {
+                // mark as dead by setting address to 0 (TODO: clean this up)
+                AlreadyMapped = true;
+            }
+        }
+
+        if (!AlreadyMapped) {
+            memcpy(&PointerMap[NumPointerNodes++], &Node, sizeof(pointer_node));
         }
     }
+
+    int NewNumPointerNodes = NumPointerNodes;
+
+    // TODO: does this recursion work?
+    for (int I = PrevNumPointerNodes; I < NewNumPointerNodes; I++) {
+        if (PointerMap[I].Address) {
+            GeneratePointerMapRec((char*)&PointerMap[I].Address, NumJumps+1, MaxNumJumps);
+        }
+    }
+
+    // TODO: filter address not belonging to ".exe" module?
+    //       apparently the heap/stack do not belong to a module, so how to deal with this?
+    // checkout https://stackoverflow.com/questions/24778487/get-owner-module-from-memory-address
+}
+
+// Goes through the memory enumerating possible candidates that point to near the desired address
+void GeneratePointerMap(char *Address, int MaxNumJumps) {
+    NumPointerNodes = 0;
+    GeneratePointerMapRec(Address, 0, MaxNumJumps);
+    //TODO: maybe sort results by NumJumps and Address?
+    printf("GeneratePointerMap() finished after finding %d nodes.\n", NumPointerNodes);
 }
 
 // expects a null terminated input
@@ -249,8 +358,7 @@ int main(int argc, char **argv) {
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO(); (void)io;
-        // TODO
-        //io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;  // Enable Keyboard Controls
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;  // Enable Keyboard Controls
 
         ImGui_ImplGlfw_InitForOpenGL(window, true);
         ImGui_ImplOpenGL3_Init(glsl_version);
@@ -263,7 +371,7 @@ int main(int argc, char **argv) {
     // TODO: free this properly (and also maybe do something about the magic number)
     //MEMORY_BASIC_INFORMATION32 ProcessData = {};
     ProcessData = (MEMORY_BASIC_INFORMATION *) calloc(MAX_CANDIDATES, sizeof(*ProcessData));
-    MemoryBuffer = (unsigned char **) calloc(MAX_CANDIDATES, sizeof(*MemoryBuffer));
+    MemoryBuffer = (char **) calloc(MAX_CANDIDATES, sizeof(*MemoryBuffer));
 
     double LastTime = glfwGetTime();
     double DeltaTime = 0, NowTime = 0;
@@ -271,11 +379,15 @@ int main(int argc, char **argv) {
 
     bool Attached = false;
     int Searched = MODE_NONE;
+    uint64_t AddressToBeLookedup = 0;
 
     char ProcessIdBuffer[200] = {};
     char ValueToFind[40] = {};
     char AddressToWrite[40] = {};
     char ValueToWrite[40] = {};
+    char PointerToBeMapped[40] = {};
+    char AddressToBeLookedupText[40] = {};
+    char MaxRecursionsText[40] = {};
     while (!glfwWindowShouldClose(window)) {
 
         // start of frame
@@ -296,10 +408,10 @@ int main(int argc, char **argv) {
             ImGui::NewFrame();
         }
 
-        // Main Window
+        // Main Scan Window
         {
             ImGui::SetNextWindowSize(ImVec2(0, 500));
-            ImGui::Begin("Main Window");
+            ImGui::Begin("Scan");
             if (!Attached) {
                 ImGui::InputText("Process ID", ProcessIdBuffer, IM_ARRAYSIZE(ProcessIdBuffer));
                 if (ImGui::Button("Attach")) {
@@ -317,9 +429,10 @@ int main(int argc, char **argv) {
                         char ModName[200];
                         GetModuleFileNameEx(ProcessHandle, Mod, ModName, sizeof(ModName)/sizeof(char));
                         printf("Module name: %s\n", ModName);
-                        BaseAddress = (DWORD64) &Mod;
+                        BaseAddress = (DWORD64) Mod;
                     }
 #endif
+                    ScanEverything();
 
                     Attached = true;
                 }
@@ -355,8 +468,8 @@ int main(int argc, char **argv) {
                     ImGui::Text("Attached Successfully!\n");
 
 #if 1
-                    if (NumCandidates != -1) {
-                        UpdateCandidates();
+                    if (NumCandidates > 0 && NumCandidates < 30000) {
+                        UpdateCandidates(); //TODO: update only the ones currently appearing on the screen
                     }
 #endif
 
@@ -365,8 +478,8 @@ int main(int argc, char **argv) {
 #if 1
                     if (ImGui::Button("Find Byte") && strlen(ValueToFind)) {
                         Searched = MODE_BYTE;
-                        unsigned char Target = atoi(ValueToFind);
-                        SearchForValue((char *) &Target, 1, 1);
+                        uint8_t Target = atoi(ValueToFind);
+                        SearchForValue((char *) &Target, 1, 1, false, true);
                     }
 
                     ImGui::SameLine();
@@ -377,7 +490,7 @@ int main(int argc, char **argv) {
                     if (ImGui::Button("Find Short") && strlen(ValueToFind)) {
                         Searched = MODE_SHORT;
                         unsigned short int Target = atoi(ValueToFind);
-                        SearchForValue((char *) &Target, 2, 2);
+                        SearchForValue((char *) &Target, 2, 2, false, true);
                     }
 
                     ImGui::SameLine();
@@ -387,7 +500,20 @@ int main(int argc, char **argv) {
                     if (ImGui::Button("Find Int") && strlen(ValueToFind)) {
                         Searched = MODE_INTEGER;
                         int Target = atoi(ValueToFind);
-                        SearchForValue((char *) &Target, sizeof(Target), sizeof(Target));
+                        SearchForValue((char *) &Target, sizeof(Target), sizeof(Target), false, true);
+                    }
+
+                    ImGui::SameLine();
+#endif
+
+
+#if 1
+                    // TODO: handle values starting with "0x", and also handle decimal values
+                    if (ImGui::Button("Find Pointer") && strlen(ValueToFind)) {
+                        Searched = MODE_POINTER;
+                        uint64_t Target = strtoll(ValueToFind, NULL, 16);
+                        fprintf(stderr, "Looking for Pointer 0x%I64x\n", Target);
+                        SearchForValue((char *) &Target, sizeof(Target), sizeof(Target), true, true);
                     }
 
                     ImGui::SameLine();
@@ -397,7 +523,7 @@ int main(int argc, char **argv) {
                         Searched = MODE_UNICODE;
                         char UnicodeStr[50] = {};
                         int LenInBytes = ConvertUtf8ToUtf16(ValueToFind, UnicodeStr, 50);
-                        SearchForValue(UnicodeStr, LenInBytes, 1);
+                        SearchForValue(UnicodeStr, LenInBytes, 1, false, true);
                     }
 
 #if 1
@@ -407,7 +533,7 @@ int main(int argc, char **argv) {
                         Searched = MODE_ASCII;
                         char AsciiStr[50] = {};
                         strcpy(AsciiStr, ValueToFind);
-                        SearchForValue(AsciiStr, strlen(AsciiStr), 1);
+                        SearchForValue(AsciiStr, strlen(AsciiStr), 1, false, true);
                     }
 
                     ImGui::SameLine();
@@ -417,25 +543,35 @@ int main(int argc, char **argv) {
                         strcpy(ValueToFind, "");
                     }
 
-                    ImGui::Text("BaseAddress: 0x%p\n", BaseAddress);
+                    ImGui::Text("Base address: 0x%p\n", BaseAddress);
                     ImGui::Text("Candidates: %d\n", NumCandidates);
 
+                    // TODO: optimize this for a big number of candidates
                     switch (Searched) {
                         case MODE_NONE:
                             break;
                         case MODE_BYTE:
                             for (int I = 0; I < NumCandidates; I++) {
-                                ImGui::Text("%p %u\n", (unsigned char *) Candidates[I].Address, *((char *)Candidates[I].PointerToCurValue));
+                                ImGui::Text("%p %u\n", (char *) Candidates[I].Address, *((char *)Candidates[I].PointerToCurValue));
                             }
                             break;
                         case MODE_SHORT:
                             for (int I = 0; I < NumCandidates; I++) {
-                                ImGui::Text("%p %d\n", (unsigned char *) Candidates[I].Address, *((unsigned short int *)Candidates[I].PointerToCurValue));
+                                ImGui::Text("%p %d\n", (char *) Candidates[I].Address, *((unsigned short int *)Candidates[I].PointerToCurValue));
                             }
                             break;
                         case MODE_INTEGER:
                             for (int I = 0; I < NumCandidates; I++) {
-                                ImGui::Text("%p %d\n", (unsigned char *) Candidates[I].Address, *((int *)Candidates[I].PointerToCurValue));
+                                ImGui::Text("%p %p %d\n", (char *) Candidates[I].Address, Candidates[I].PointerToCurValue, *((int *)Candidates[I].PointerToCurValue));
+                            }
+                            break;
+                        case MODE_POINTER:
+                            for (int I = 0; I < NumCandidates; I++) {
+                                // TODO: handle values starting with "0x", and also handle decimal values
+                                // TODO: fix the offset display, it's not suposed to update when we change the "ValueToFind" field
+                                uint64_t Target = strtoll(ValueToFind, NULL, 16);
+                                ImGui::Text("%p 0x%p 0x%x\n", (char *) Candidates[I].Address, *((uint64_t *)Candidates[I].PointerToCurValue),
+                                            Target - *((uint64_t *)Candidates[I].PointerToCurValue));
                             }
                             break;
                         case MODE_UNICODE:
@@ -444,7 +580,7 @@ int main(int argc, char **argv) {
                                 ConvertUtf16toUtf8((char *) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes, Output, 100);
 
                                 char Text[100] = {};
-                                sprintf(Text, "%p ", (unsigned char *) Candidates[I].Address);
+                                sprintf(Text, "%p ", (char *) Candidates[I].Address);
                                 int CurSize = strlen(Text);
                                 sprintf(Text + CurSize, "%s", Output);
                                 CurSize = strlen(Text);
@@ -458,7 +594,7 @@ int main(int argc, char **argv) {
                                 strncpy(Output, (char *) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes);
 
                                 char Text[100] = {};
-                                sprintf(Text, "%p ", (unsigned char *) Candidates[I].Address);
+                                sprintf(Text, "%p ", (char *) Candidates[I].Address);
                                 int CurSize = strlen(Text);
                                 sprintf(Text + CurSize, "%s", Output);
                                 CurSize = strlen(Text);
@@ -481,7 +617,7 @@ int main(int argc, char **argv) {
         // Writing Window
         if (Attached) {
             ImGui::SetNextWindowSize(ImVec2(0, 0));
-            ImGui::Begin("Writing Window");
+            ImGui::Begin("Write");
             ImGui::InputText("Address", AddressToWrite, IM_ARRAYSIZE(AddressToWrite));
             ImGui::InputText("Value", ValueToWrite, IM_ARRAYSIZE(ValueToWrite));
 
@@ -511,6 +647,87 @@ int main(int argc, char **argv) {
                 if (!Err) {
                     printf("ERROR writing process memory!\n");
                 }
+            }
+
+            ImGui::End();
+        }
+#endif
+
+#if 1
+        // Address Lookup Window
+        if (Attached) {
+            ImGui::SetNextWindowSize(ImVec2(0, 0));
+            ImGui::Begin("Address Lookup");
+
+            ImGui::InputText("Address ", AddressToBeLookedupText, IM_ARRAYSIZE(AddressToBeLookedupText));
+
+            // TODO: handle values starting with "0x", and also handle decimal values
+            if (ImGui::Button("Search")) {
+                AddressToBeLookedup = strtoll(AddressToBeLookedupText, NULL, 16);
+            }
+
+            if (AddressToBeLookedup != 0) {
+                for (int I = 0; I < NumRegions; I++) {
+                    if (AddressToBeLookedup > (uint64_t) ProcessData[I].BaseAddress &&
+                        AddressToBeLookedup < (uint64_t) ProcessData[I].BaseAddress + ProcessData[I].RegionSize) {
+
+                        // TODO: refactor this, it's duplicated with ScanEverything() and UpdateCandidates()
+                        SIZE_T BytesRead;
+                        int ReturnValue = ReadProcessMemory(ProcessHandle, (LPCVOID) ProcessData[I].BaseAddress, (LPVOID) MemoryBuffer[I], ProcessData[I].RegionSize, &BytesRead);
+                        if (!ReturnValue) {
+                            int ErrorValue = GetLastError();
+                            //fprintf(stderr, "ERROR: Tried to read from process handle 0x%p at address 0x%p and region size %lld with protection 0x%x\n", (LPVOID) ProcessHandle, (LPVOID) ProcessData[NumRegions].BaseAddress, ProcessData[NumRegions].RegionSize, ProcessData[NumRegions].Protect);
+                            //fprintf(stderr, "ERROR: BytesRead %lld\n", BytesRead);
+                            // TODO: does this ever happen? If we so, are we handling it correctly?
+                            //       Isn't it possible that not incrementing NumRegions here leads to problems? Maybe not. I think this is correct.
+                            fprintf(stderr, "ERROR: Problem occurred while reading region. Code: %d\n", ErrorValue); 
+                        }
+
+                        char *MirrorAddress = &MemoryBuffer[I][AddressToBeLookedup - (uint64_t) ProcessData[I].BaseAddress];
+                        ImGui::Text("Float: %f", *((float *) MirrorAddress));
+                        ImGui::Text("Int: %d", *((int *) MirrorAddress));
+                        ImGui::Text("Char: %c | %d", *((char *) MirrorAddress), *((uint8_t *) MirrorAddress));
+                        ImGui::Text("Pointer: %llx", *((uint64_t *) MirrorAddress));
+                        // TODO: ASCII and Unicode
+                    }
+                }
+            }
+
+            ImGui::End();
+        }
+#endif
+
+#if 1
+        // Pointer Map Window
+        if (Attached) {
+            ImGui::SetNextWindowSize(ImVec2(0, 0));
+            ImGui::Begin("Pointer Map");
+
+            ImGui::InputText("Address ", PointerToBeMapped, IM_ARRAYSIZE(PointerToBeMapped));
+            ImGui::InputText("MaxRecursions ", MaxRecursionsText, IM_ARRAYSIZE(MaxRecursionsText));
+
+
+            // TODO: handle values starting with "0x", and also handle decimal values
+            if (ImGui::Button("Generate Pointer Map")) {
+                uint64_t Target = strtoll(PointerToBeMapped, NULL, 16);
+                GeneratePointerMap((char *) &Target, atoi(MaxRecursionsText));
+            }
+
+            ImGui::Text("Nodes: %d\n", NumPointerNodes);
+            // TODO: optimize this for a big number of candidates
+            for (int I = 0; I < NumPointerNodes; I++) {
+// TODO: find a good way to reconstruct an optimal path
+#if 0
+                char OffsetStr[40] = {};
+                char TmpStr[40] = {};
+                // TODO: optimize this
+                for (int J = 0; J < PointerMap[I].NumJumps; J++) {
+                    sprintf(TmpStr, "%s0x%03x ", OffsetStr, PointerMap[I].NextJumpOffset);
+                    strcpy(OffsetStr, TmpStr);
+                }
+#endif
+
+                ImGui::Text("%p %llx 0x%03x %d\n", PointerMap[I].Address, *((uint64_t*)PointerMap[I].Value), PointerMap[I].NextJumpOffset, PointerMap[I].NumJumps);
             }
 
             ImGui::End();

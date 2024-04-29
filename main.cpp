@@ -14,16 +14,13 @@
 
 #include "gl3w/gl3w.c"
 
-#define IMGUI_IMPL_OPENGL_LOADER_GL3W
 #include "GL/gl3w.h"
 #include "GLFW/glfw3.h"
 
-#include "imgui/imgui.cpp"
-#include "imgui/imgui_draw.cpp"
-#include "imgui/imgui_widgets.cpp"
-#include "imgui/imgui_demo.cpp"
-#include "imgui/imgui_impl_glfw.cpp"
-#include "imgui/imgui_impl_opengl3.cpp"
+#define IMGUI_IMPL_OPENGL_LOADER_GL3W
+#include "imgui.h"
+#include "backends/imgui_impl_glfw.h"
+#include "backends/imgui_impl_opengl3.h"
 
 #define WRITABLE (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)
 

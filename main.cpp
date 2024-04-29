@@ -1,6 +1,7 @@
 #define NTDDI_VERSION NTDDI_WIN7
 #define _WIN32_WINNT _WIN32_WINNT_WIN7
 
+#define NOMINMAX
 //#include <afxwin.h>
 #include <windows.h>
 #include <Psapi.h>
@@ -8,6 +9,8 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <algorithm>
 
 #include "gl3w/gl3w.c"
 
@@ -61,6 +64,7 @@ struct candidate_info {
 
 // Array storing all current candidates
 #define MAX_CANDIDATES 2000000
+#define MAX_RENDERED_CANDIDATES 30000 // more than this slows down the application significantly and isn't very useful anyway
 candidate_info *Candidates = (candidate_info *) calloc(MAX_CANDIDATES, sizeof(*Candidates));
 int *DeadCandidates = (int *) calloc(MAX_CANDIDATES, sizeof(*DeadCandidates));
 int NumCandidates = -1;
@@ -94,6 +98,32 @@ enum search_mode {
 //
 // MAIN PROGRAM
 //
+
+int CompareCandidatesByAddress(const void *A, const void *B) {
+    candidate_info CA = *((candidate_info *) A);
+    candidate_info CB = *((candidate_info *) B);
+
+    if (CA.Address > CB.Address) return 1;
+    if (CA.Address < CB.Address) return -1;
+    return 0;
+}
+
+void SortCandidatesByAddress() {
+    qsort(Candidates, NumCandidates, sizeof(*Candidates), CompareCandidatesByAddress);
+}
+
+int ComparePointerMapNodeByAddress(const void *A, const void *B) {
+    pointer_node NA = *((pointer_node *) A);
+    pointer_node NB = *((pointer_node *) B);
+
+    if (NA.Address > NB.Address) return 1;
+    if (NA.Address < NB.Address) return -1;
+    return 0;
+}
+
+void SortPointerMapByAddress() {
+    qsort(PointerMap, NumPointerNodes, sizeof(*PointerMap), ComparePointerMapNodeByAddress);
+}
 
 static void GlfwErrorCallback(int error, const char* description)
 {
@@ -252,6 +282,9 @@ void SearchForValue(char *Data, int Len, int Stride, bool IsPointer, bool ForceR
         NumCandidates = NumCandidates - NumDeadCandidates;
 #endif
     }
+
+    SortCandidatesByAddress();
+
     //fprintf(stderr, "SearchForValue() end\n");
 }
 
@@ -306,8 +339,10 @@ void GeneratePointerMapRec(char *Address, int NumJumps, int MaxNumJumps) {
 void GeneratePointerMap(char *Address, int MaxNumJumps) {
     NumPointerNodes = 0;
     GeneratePointerMapRec(Address, 0, MaxNumJumps);
-    //TODO: maybe sort results by NumJumps and Address?
     printf("GeneratePointerMap() finished after finding %d nodes.\n", NumPointerNodes);
+
+    //TODO: maybe sort results by Address AND NumJumps?
+    SortPointerMapByAddress();
 }
 
 // expects a null terminated input
@@ -468,7 +503,7 @@ int main(int argc, char **argv) {
                     ImGui::Text("Attached Successfully!\n");
 
 #if 1
-                    if (NumCandidates > 0 && NumCandidates < 30000) {
+                    if (NumCandidates > 0 && NumCandidates < MAX_RENDERED_CANDIDATES) {
                         UpdateCandidates(); //TODO: update only the ones currently appearing on the screen
                     }
 #endif
@@ -551,22 +586,22 @@ int main(int argc, char **argv) {
                         case MODE_NONE:
                             break;
                         case MODE_BYTE:
-                            for (int I = 0; I < NumCandidates; I++) {
+                            for (int I = 0; I < std::min(NumCandidates, MAX_RENDERED_CANDIDATES); I++) {
                                 ImGui::Text("%p %u\n", (char *) Candidates[I].Address, *((char *)Candidates[I].PointerToCurValue));
                             }
                             break;
                         case MODE_SHORT:
-                            for (int I = 0; I < NumCandidates; I++) {
+                            for (int I = 0; I < std::min(NumCandidates, MAX_RENDERED_CANDIDATES); I++) {
                                 ImGui::Text("%p %d\n", (char *) Candidates[I].Address, *((unsigned short int *)Candidates[I].PointerToCurValue));
                             }
                             break;
                         case MODE_INTEGER:
-                            for (int I = 0; I < NumCandidates; I++) {
+                            for (int I = 0; I < std::min(NumCandidates, MAX_RENDERED_CANDIDATES); I++) {
                                 ImGui::Text("%p %p %d\n", (char *) Candidates[I].Address, Candidates[I].PointerToCurValue, *((int *)Candidates[I].PointerToCurValue));
                             }
                             break;
                         case MODE_POINTER:
-                            for (int I = 0; I < NumCandidates; I++) {
+                            for (int I = 0; I < std::min(NumCandidates, MAX_RENDERED_CANDIDATES); I++) {
                                 // TODO: handle values starting with "0x", and also handle decimal values
                                 // TODO: fix the offset display, it's not suposed to update when we change the "ValueToFind" field
                                 uint64_t Target = strtoll(ValueToFind, NULL, 16);
@@ -575,7 +610,7 @@ int main(int argc, char **argv) {
                             }
                             break;
                         case MODE_UNICODE:
-                            for (int I = 0; I < NumCandidates; I++) {
+                            for (int I = 0; I < std::min(NumCandidates, MAX_RENDERED_CANDIDATES); I++) {
                                 char Output[100] = {};
                                 ConvertUtf16toUtf8((char *) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes, Output, 100);
 
@@ -589,7 +624,7 @@ int main(int argc, char **argv) {
                             }
                             break;
                         case MODE_ASCII:
-                            for (int I = 0; I < NumCandidates; I++) {
+                            for (int I = 0; I < std::min(NumCandidates, MAX_RENDERED_CANDIDATES); I++) {
                                 char Output[100] = {};
                                 strncpy(Output, (char *) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes);
 
@@ -604,6 +639,11 @@ int main(int argc, char **argv) {
                             break;
                         default:
                             assert(false);
+                    }
+
+                    // TODO: something better?
+                    if (MAX_RENDERED_CANDIDATES < NumCandidates) {
+                        ImGui::Text("...%d more results hidden to avoid slowing down the application...\n", NumCandidates - MAX_RENDERED_CANDIDATES);
                     }
 #endif
                 } else {
@@ -705,7 +745,6 @@ int main(int argc, char **argv) {
 
             ImGui::InputText("Address ", PointerToBeMapped, IM_ARRAYSIZE(PointerToBeMapped));
             ImGui::InputText("MaxRecursions ", MaxRecursionsText, IM_ARRAYSIZE(MaxRecursionsText));
-
 
             // TODO: handle values starting with "0x", and also handle decimal values
             if (ImGui::Button("Generate Pointer Map")) {

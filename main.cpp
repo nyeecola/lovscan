@@ -25,7 +25,8 @@
 #define WRITABLE (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)
 
 /* TODO:
- * - Sort pointer mapping output.
+ * - Sort processes by name
+ * - Find out how to make column size fit to input text and not completely collapse (other than setting a fixed column width as we're doing right now)
  * - Make address copyable with mouse.
  * - Improve pointer mapping.
  * - Improve pointer mapping performance.
@@ -65,6 +66,7 @@ struct candidate_info {
 candidate_info *Candidates = (candidate_info *) calloc(MAX_CANDIDATES, sizeof(*Candidates));
 int *DeadCandidates = (int *) calloc(MAX_CANDIDATES, sizeof(*DeadCandidates));
 int NumCandidates = -1;
+char CandidateAddressText[MAX_RENDERED_CANDIDATES][32] = {};
 
 // TODO: think abou this, is it too small? too big? (probably 4096 is safer?)
 #define POINTER_MAX_RANGE 4096
@@ -420,6 +422,7 @@ int main(int argc, char **argv) {
     char PointerToBeMapped[40] = {};
     char AddressToBeLookedupText[40] = {};
     char MaxRecursionsText[40] = {};
+    char PID_Text[1024][6] = {};
     while (!glfwWindowShouldClose(window)) {
 
         // start of frame
@@ -440,7 +443,13 @@ int main(int argc, char **argv) {
             ImGui::NewFrame();
         }
 
-        // Main Scan Window
+
+#if 0
+        // DEBUG
+        ImGui::ShowDemoWindow();
+#endif
+
+        // Main Scan Window (and Process window)
         {
             ImGui::SetNextWindowSize(ImVec2(0, 500));
             ImGui::Begin("Scan");
@@ -454,7 +463,7 @@ int main(int argc, char **argv) {
                     DWORD Needed;
                     if (EnumProcessModules(ProcessHandle, &Mod, sizeof(Mod), &Needed)) {
                         if (Needed > sizeof(Mod)) {
-                            // This might be a problem since we need the right module to get the process base address.
+                            // TODO: This might be a problem since we need the right module to get the process base address.
                             // Check out https://stackoverflow.com/questions/14467229/get-base-address-of-process
                             //fprintf(stderr, "Needed %d bytes for Module handles array, but got only %zd instead\n", Needed, sizeof(Mod));
                         }
@@ -471,11 +480,15 @@ int main(int argc, char **argv) {
 
 #if 1
                 DWORD Processes[1024], ProcessesSizeBytes, ProcessesSize;
+
                 if ( !EnumProcesses( Processes, sizeof(Processes), &ProcessesSizeBytes ) ) {
                     fprintf(stderr, "ERROR: Failed to enumerate processes.\n");
                     return NULL;
                 }
 
+                ImGui::BeginTable("Processes", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoHostExtendX);
+                ImGui::TableSetupColumn("process_name", ImGuiTableColumnFlags_WidthFixed, 300.0f);
+                ImGui::TableSetupColumn("proces_id", ImGuiTableColumnFlags_WidthFixed, 60.0f);
                 for (int I = 0; I < ProcessesSizeBytes / sizeof(DWORD); I++) {
                     HANDLE H = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, Processes[I]);
                     if (H) {
@@ -489,11 +502,23 @@ int main(int argc, char **argv) {
                                 //fprintf(stderr, "Needed %d bytes for Module handles array, but got only %zd instead\n", Needed, sizeof(Mod));
                             }
                             GetModuleBaseName(H, Mod, ProcessName, sizeof(ProcessName)/sizeof(char));
-                            ImGui::Text("%6d %s\n", Processes[I], ProcessName);
+
+                            ImGui::TableNextRow();
+
+                            ImGui::TableNextColumn();
+                            ImGui::Text("%s", ProcessName);
+
+                            ImGui::TableNextColumn();
+                            char PID_TextLabel[20] = {};
+                            sprintf(PID_TextLabel, "##PID_Text%d", I);
+                            sprintf(PID_Text[I], "%6d", Processes[I]);
+                            ImGui::SetNextItemWidth(-FLT_MIN);
+                            ImGui::InputText(PID_TextLabel, PID_Text[I], sizeof(PID_Text[I]), ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_AutoSelectAll);
                         }
                     }
                     CloseHandle(H);
                 }
+                ImGui::EndTable();
 #endif
             } else {
                 if (ProcessHandle) {
@@ -578,65 +603,105 @@ int main(int argc, char **argv) {
                     ImGui::Text("Base address: 0x%p\n", BaseAddress);
                     ImGui::Text("Candidates: %d\n", NumCandidates);
 
-                    // TODO: optimize this for a big number of candidates
+                    ImGui::BeginTable("Candidates", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoHostExtendX);
+                    ImGui::TableSetupColumn("candidate_address", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+                    ImGui::TableSetupColumn("candidate_value"); // TODO: make this selectable in case we're in MODE_POINTER
+                    ImGui::TableSetupColumn("candidate_offset"); // only used for pointers
+
+                    // TODO: optimize this for a big number of candidates AND clean this up, it's not looking very nice
                     switch (Searched) {
                         case MODE_NONE:
                             break;
                         case MODE_BYTE:
                             for (int I = 0; I < std::min(NumCandidates, MAX_RENDERED_CANDIDATES); I++) {
-                                ImGui::Text("%p %u\n", (char *) Candidates[I].Address, *((char *)Candidates[I].PointerToCurValue));
+                                ImGui::TableNextRow();
+                                ImGui::TableNextColumn();
+                                char CandidateAddressLabel[20] = {};
+                                sprintf(CandidateAddressLabel, "##CandidateAddressLabel%d", I);
+                                sprintf(CandidateAddressText[I], "0x%llx", (uint64_t) Candidates[I].Address);
+                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                ImGui::InputText(CandidateAddressLabel, CandidateAddressText[I], sizeof(CandidateAddressText[I]), ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_AutoSelectAll);
+                                ImGui::TableNextColumn();
+                                ImGui::Text("0x%u", *((char *)Candidates[I].PointerToCurValue));
                             }
                             break;
                         case MODE_SHORT:
                             for (int I = 0; I < std::min(NumCandidates, MAX_RENDERED_CANDIDATES); I++) {
-                                ImGui::Text("%p %d\n", (char *) Candidates[I].Address, *((unsigned short int *)Candidates[I].PointerToCurValue));
+                                ImGui::TableNextRow();
+                                ImGui::TableNextColumn();
+                                char CandidateAddressLabel[20] = {};
+                                sprintf(CandidateAddressLabel, "##CandidateAddressLabel%d", I);
+                                sprintf(CandidateAddressText[I], "0x%llx", (uint64_t) Candidates[I].Address);
+                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                ImGui::InputText(CandidateAddressLabel, CandidateAddressText[I], sizeof(CandidateAddressText[I]), ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_AutoSelectAll);
+                                ImGui::TableNextColumn();
+                                ImGui::Text("%d", *((unsigned short int *)Candidates[I].PointerToCurValue));
                             }
                             break;
                         case MODE_INTEGER:
                             for (int I = 0; I < std::min(NumCandidates, MAX_RENDERED_CANDIDATES); I++) {
-                                ImGui::Text("%p %p %d\n", (char *) Candidates[I].Address, Candidates[I].PointerToCurValue, *((int *)Candidates[I].PointerToCurValue));
+                                ImGui::TableNextRow();
+                                ImGui::TableNextColumn();
+                                char CandidateAddressLabel[20] = {};
+                                sprintf(CandidateAddressLabel, "##CandidateAddressLabel%d", I);
+                                sprintf(CandidateAddressText[I], "0x%llx", (uint64_t) Candidates[I].Address);
+                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                ImGui::InputText(CandidateAddressLabel, CandidateAddressText[I], sizeof(CandidateAddressText[I]), ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_AutoSelectAll);
+                                ImGui::TableNextColumn();
+                                ImGui::Text("%d", *((int *)Candidates[I].PointerToCurValue));
                             }
                             break;
                         case MODE_POINTER:
                             for (int I = 0; I < std::min(NumCandidates, MAX_RENDERED_CANDIDATES); I++) {
-                                // TODO: handle values starting with "0x", and also handle decimal values
-                                // TODO: fix the offset display, it's not suposed to update when we change the "ValueToFind" field
+                                ImGui::TableNextRow();
+                                ImGui::TableNextColumn();
+                                char CandidateAddressLabel[20] = {};
+                                sprintf(CandidateAddressLabel, "##CandidateAddressLabel%d", I);
+                                sprintf(CandidateAddressText[I], "0x%llx", (uint64_t) Candidates[I].Address);
+                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                ImGui::InputText(CandidateAddressLabel, CandidateAddressText[I], sizeof(CandidateAddressText[I]), ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_AutoSelectAll);
+                                ImGui::TableNextColumn();
                                 uint64_t Target = strtoll(ValueToFind, NULL, 16);
-                                ImGui::Text("%p 0x%p 0x%x\n", (char *) Candidates[I].Address, *((uint64_t *)Candidates[I].PointerToCurValue),
-                                            Target - *((uint64_t *)Candidates[I].PointerToCurValue));
+                                ImGui::Text("0x%llx", *((uint64_t *)Candidates[I].PointerToCurValue));
+                                ImGui::TableNextColumn();
+                                ImGui::Text(" + 0x%llx", Target - *((uint64_t *)Candidates[I].PointerToCurValue));
                             }
                             break;
                         case MODE_UNICODE:
                             for (int I = 0; I < std::min(NumCandidates, MAX_RENDERED_CANDIDATES); I++) {
+                                ImGui::TableNextRow();
+                                ImGui::TableNextColumn();
+                                char CandidateAddressLabel[20] = {};
+                                sprintf(CandidateAddressLabel, "##CandidateAddressLabel%d", I);
+                                sprintf(CandidateAddressText[I], "0x%llx", (uint64_t) Candidates[I].Address);
+                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                ImGui::InputText(CandidateAddressLabel, CandidateAddressText[I], sizeof(CandidateAddressText[I]), ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_AutoSelectAll);
+                                ImGui::TableNextColumn();
                                 char Output[100] = {};
                                 ConvertUtf16toUtf8((char *) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes, Output, 100);
-
-                                char Text[100] = {};
-                                sprintf(Text, "%p ", (char *) Candidates[I].Address);
-                                int CurSize = strlen(Text);
-                                sprintf(Text + CurSize, "%s", Output);
-                                CurSize = strlen(Text);
-
-                                ImGui::Text("%s\n", Text);
+                                ImGui::Text("%s", Output);
                             }
                             break;
                         case MODE_ASCII:
                             for (int I = 0; I < std::min(NumCandidates, MAX_RENDERED_CANDIDATES); I++) {
+                                ImGui::TableNextRow();
+                                ImGui::TableNextColumn();
+                                char CandidateAddressLabel[20] = {};
+                                sprintf(CandidateAddressLabel, "##CandidateAddressLabel%d", I);
+                                sprintf(CandidateAddressText[I], "0x%llx", (uint64_t) Candidates[I].Address);
+                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                ImGui::InputText(CandidateAddressLabel, CandidateAddressText[I], sizeof(CandidateAddressText[I]), ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_AutoSelectAll);
+                                ImGui::TableNextColumn();
                                 char Output[100] = {};
                                 strncpy(Output, (char *) Candidates[I].PointerToCurValue, Candidates[I].ValueSizeInBytes);
-
-                                char Text[100] = {};
-                                sprintf(Text, "%p ", (char *) Candidates[I].Address);
-                                int CurSize = strlen(Text);
-                                sprintf(Text + CurSize, "%s", Output);
-                                CurSize = strlen(Text);
-
-                                ImGui::Text("%s\n", Text);
+                                ImGui::Text("%s", Output);
                             }
                             break;
                         default:
                             assert(false);
                     }
+
+                    ImGui::EndTable();
 
                     // TODO: something better?
                     if (MAX_RENDERED_CANDIDATES < NumCandidates) {
@@ -692,6 +757,7 @@ int main(int argc, char **argv) {
 
 #if 1
         // Address Lookup Window
+        // TODO: fix the offset display, it's not suposed to update when we change the "ValueToFind" field
         if (Attached) {
             ImGui::SetNextWindowSize(ImVec2(0, 0));
             ImGui::Begin("Address Lookup");
